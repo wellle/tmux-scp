@@ -13,13 +13,14 @@ option() {
 yank_key=$(option @tmux-scp-yank-key C-y)
 put_key=$(option @tmux-scp-put-key C-p)
 alias_index=$(option @tmux-scp-alias-index 100)
-popup="display-popup -E -w 80% -h 50% -T ' tmux-scp '"
+border=$(option @tmux-scp-border-style fg=blue)
 
 tmux bind-key "$yank_key" run-shell -b "'$bin' --client '#{client_name}' yank '#{pane_id}'"
 tmux bind-key "$put_key" run-shell -b "'$bin' --client '#{client_name}' put '#{pane_id}'"
 
 i=$alias_index
 for cmd in scp yank put; do
+    popup="display-popup -E -b rounded -S '$border' -w 80% -h 50% -T '#[bold] tmux-scp: $cmd '"
     tmux set-option -s "command-alias[$i]" "$cmd=$popup '$bin' $cmd"
     i=$((i + 1))
 done

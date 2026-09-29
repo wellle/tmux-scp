@@ -42,13 +42,16 @@ command line:
 
 4. Press prefix C-p. A popup shows what is about to happen, y copies:
 
-   from  me@app-1.example.com:/home/me/logs
-   to    me@db-2.example.com:/home/me/tmp
-
-     report.csv
-     errors.log  <- exists, will be overwritten
-
-   Copy 2 files? [y/N]
+   +- tmux-scp: put 2 files ------------------------------------+
+   |                                                            |
+   |  me@app-1.example.com  ~/logs                              |
+   |    |  report.csv    12.3 KB                                |
+   |    |  errors.log     4.1 MB  overwrites existing           |
+   |    v                                                       |
+   |  me@db-2.example.com   ~/tmp                               |
+   |                                                            |
+   |  y copy 2 files, 4.1 MB, any other key cancels             |
+   +------------------------------------------------------------+
 ```
 
 That is the whole flow. The only thing you type is file names, and you
@@ -116,6 +119,9 @@ Options, set them before the plugin loads:
 | `@tmux-scp-yank-key` | `C-y` | prefix key to yank |
 | `@tmux-scp-put-key` | `C-p` | prefix key to put (many configs have `p` as `paste-buffer`) |
 | `@tmux-scp-alias-index` | `100` | first of the three `command-alias` slots used for `:scp`, `:yank` and `:put` |
+| `@tmux-scp-border-style` | `fg=blue` | style of the popup's border and title |
+
+The popup uses colors unless `NO_COLOR` is set.
 
 For the `tmux-scp show` debugging command, link the script into your `PATH`:
 `ln -s ~/.tmux/plugins/tmux-scp/tmux-scp ~/bin/`.

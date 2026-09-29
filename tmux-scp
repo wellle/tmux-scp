@@ -44,6 +44,8 @@ Environment:
                          instead of reading the directory from the prompt
     TMUX_SCP_PASTEBOARD  'general' (default) or 'find', which tests use to
                          leave the real clipboard alone
+    TMUX_SCP_STATE       where the yank is kept, default
+                         ~/.cache/tmux-scp/yank.json
 """
 
 import glob
@@ -59,7 +61,7 @@ import time
 import tty
 
 SELF = os.path.abspath(__file__)
-STATE = os.path.expanduser('~/.cache/tmux-scp/yank.json')
+STATE = os.path.expanduser(os.environ.get('TMUX_SCP_STATE', '~/.cache/tmux-scp/yank.json'))
 PROMPT_RE = re.compile(os.environ.get('TMUX_SCP_PROMPT', r'[$#%>:]( |$)'))
 # the directory and user@host in prompts like `user@host ~/dir $`,
 # `user@host:~/dir$` or `[user@host /tmp]$`
@@ -73,6 +75,12 @@ CLIP_LIMIT = 10 << 20
 PASTEBOARD = os.environ.get('TMUX_SCP_PASTEBOARD', 'general')
 # pbcopy and pbpaste assume MacRoman unless told otherwise
 UTF8_ENV = dict(os.environ, LC_CTYPE='UTF-8')
+
+# the popup's colors; NO_COLOR turns them off
+COLOR = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
+BOLD, DIM, RED, GREEN, YELLOW, BLUE, CYAN = '1', '2', '31', '32', '33', '34', '36'
+# how many files the popup lists before summing up the rest
+MAX_LISTED = 12
 
 # JXA printing the paths of the files copied in Finder, one per line
 CLIP_FILES_JS = '''
@@ -110,32 +118,42 @@ tm display -p '#{pane_current_path}' || exit 1
 tm capture-pane -p -J -E "$(tm display -p '#{cursor_y}')"
 '''
 
-# $1: directory, $2...: words. Prints the absolute directory, then "d NAME"
-# or "f NAME" for each existing file, expanding globs (IFS= keeps words with
-# spaces in one piece).
+# $1: directory, $2...: words. Prints the absolute directory and $HOME, then
+# "d - NAME" for each existing directory and "f SIZE NAME" for each other
+# file, expanding globs (IFS= keeps words with spaces in one piece). Only
+# regular files are measured, wc could block on anything else.
 REMOTE_FILES = REMOTE_EXPAND + '''
 cd "$(expand "$1")" || exit 1
 pwd
+printf '%s\\n' "$HOME"
 shift
 IFS=
 for p; do
     p=$(expand "$p")
     for f in $p; do
-        if [ -d "$f" ]; then printf 'd %s\\n' "$f"; elif [ -e "$f" ]; then printf 'f %s\\n' "$f"; fi
+        if [ -d "$f" ]; then
+            printf 'd - %s\\n' "$f"
+        elif [ -f "$f" ]; then
+            s=$(wc -c < "$f" | tr -d ' ')
+            printf 'f %s %s\\n' "${s:-?}" "$f"
+        elif [ -e "$f" ]; then
+            printf 'f ? %s\\n' "$f"
+        fi
     done
 done
 exit 0
 '''
 
 # $1: session, $2: directory or empty for the session's, $3...: names.
-# Prints the absolute directory, "w" or "r" for whether it is writable, then
-# each name that already exists there.
+# Prints the absolute directory, $HOME, "w" or "r" for whether the directory
+# is writable, then each name that already exists there.
 REMOTE_DEST = 't=$1' + REMOTE_TM + REMOTE_EXPAND + '''
 d=$2
 shift 2
 if [ -n "$d" ]; then d=$(expand "$d"); else d=$(tm display -p '#{pane_current_path}') || exit 1; fi
 cd "$d" || exit 1
 pwd
+printf '%s\\n' "$HOME"
 if [ -w . ]; then echo w; else echo r; fi
 for f; do [ -e "$f" ] && printf '%s\\n' "$f"; done
 exit 0
@@ -179,6 +197,24 @@ def message(client, text):
     subprocess.run(argv + [text.replace('#', '##')])
 
 
+def style(text, *codes):
+    codes = [c for c in codes if c]
+    if not COLOR or not codes or not text:
+        return text
+    return '\033[%sm%s\033[0m' % (';'.join(codes), text)
+
+
+def done(text):
+    """Show a success line in the popup long enough to be seen.
+
+    Call it before message(): a popup stops redrawing once a status line
+    message is shown.
+    """
+    if sys.stdin.isatty():
+        print('\n  %s %s' % (style('done', BOLD, GREEN), text), flush=True)
+        time.sleep(0.8)
+
+
 def is_clip(place):
     return place in CLIP_WORDS
 
@@ -194,17 +230,20 @@ class Endpoint:
     may start with ~ until a remote call resolves it.
     """
 
-    def __init__(self, host=None, session='', dir=None, plain=False):
+    def __init__(self, host=None, session='', dir=None, plain=False, home=None):
         self.host = host
         self.session = session
         self.dir = dir
         self.plain = plain
+        # for showing paths with ~, filled in by remote calls
+        self.home = home if host else os.path.expanduser('~')
         # the file name to copy to, when TO names a file rather than a directory
         self.rename = None
         self._ssh_config = None
 
     def to_dict(self):
-        return {'host': self.host, 'session': self.session, 'dir': self.dir, 'plain': self.plain}
+        return {'host': self.host, 'session': self.session, 'dir': self.dir, 'plain': self.plain,
+                'home': self.home}
 
     def path(self, name):
         return posixpath.join(self.dir, name)
@@ -230,16 +269,37 @@ class Endpoint:
             return 'local:%s' % where
         return '%s@%s:%s' % (self.user(), self.host.split('@')[-1], where)
 
+    def who(self):
+        return 'local' if self.host is None else '%s@%s' % (self.user(), self.host.split('@')[-1])
+
+    def styled_who(self, width=0):
+        """who(), padded to width, with the host's domain dimmed."""
+        text = self.who()
+        pad = ' ' * max(0, width - len(text))
+        user, _, host = text.rpartition('@')
+        name, dot, domain = host.partition('.')
+        return style((user + '@' if user else '') + name, BOLD, CYAN) + style(dot + domain, DIM) + pad
+
+    def tilde(self, name=''):
+        """The directory, or name in it, with the home directory shortened to ~."""
+        where = self.path(name) if name else self.dir
+        home = (self.home or '').rstrip('/')
+        if home and (where == home or where.startswith(home + '/')):
+            return '~' + where[len(home):]
+        return where
+
     def same_place(self, other):
         return (self.host, self.dir) == (other.host, other.dir)
 
 
 class Files:
-    """Files to copy: [name, is_dir] pairs, relative to an endpoint's directory."""
+    """Files to copy: [name, is_dir] pairs relative to an endpoint's
+    directory, and the sizes of the regular files among them."""
 
-    def __init__(self, ep, files):
+    def __init__(self, ep, files, sizes=None):
         self.ep = ep
         self.files = files
+        self.sizes = sizes or {}
 
 
 class Text:
@@ -401,13 +461,18 @@ def dedupe(files):
 
 
 def existing_files(ep, words):
-    """Return [name, is_dir] for each word that names files in ep.dir."""
+    """Return Files for the words that name files in ep.dir."""
+    files, sizes = [], {}
     if ep.host is not None:
         lines = remote(ep.host, REMOTE_FILES, ep.dir, *words)
-        ep.dir = lines[0]
-        files = [[line[2:], line[0] == 'd'] for line in lines[1:] if line]
+        ep.dir, ep.home = lines[0], lines[1]
+        for line in lines[2:]:
+            if line:
+                kind, n, name = line.split(' ', 2)
+                files.append([name, kind == 'd'])
+                if n.isdigit():
+                    sizes[name] = int(n)
     else:
-        files = []
         for w in map(os.path.expanduser, words):
             full = os.path.join(ep.dir, w)
             matches = sorted(glob.glob(full)) if glob.has_magic(w) else [full]
@@ -415,18 +480,22 @@ def existing_files(ep, words):
                 if os.path.exists(f):
                     name = f if os.path.isabs(w) else os.path.relpath(f, ep.dir)
                     files.append([name, os.path.isdir(f)])
+                    if os.path.isfile(f):
+                        sizes[name] = os.path.getsize(f)
     files = dedupe(files)
     if not files:
         raise Error('none of these exist in %s: %s' % (ep.dir, ' '.join(words)))
-    return files
+    return Files(ep, files, sizes)
 
 
 def local_files(paths):
     """Return Files for absolute local paths, relative to their directory if they share one."""
     parents = {os.path.dirname(p) for p in paths}
-    if len(parents) == 1:
-        return Files(Endpoint(dir=parents.pop()), dedupe([[os.path.basename(p), os.path.isdir(p)] for p in paths]))
-    return Files(Endpoint(dir='/'), dedupe([[p, os.path.isdir(p)] for p in paths]))
+    shared = len(parents) == 1
+    names = [os.path.basename(p) if shared else p for p in paths]
+    sizes = {n: os.path.getsize(p) for n, p in zip(names, paths) if os.path.isfile(p)}
+    files = dedupe([[n, os.path.isdir(p)] for n, p in zip(names, paths)])
+    return Files(Endpoint(dir=parents.pop() if shared else '/'), files, sizes)
 
 
 def clip_paths(data):
@@ -469,7 +538,7 @@ def resolve_source(place):
             raise Error('no such file: %s' % place)
         return local_files(matches)
     pane, ep = resolve_pane(place)
-    return Files(ep, existing_files(ep, command_words(screen(ep, pane))))
+    return existing_files(ep, command_words(screen(ep, pane)))
 
 
 def resolve_dest(place):
@@ -504,10 +573,22 @@ def summary(files, limit=120):
 
 
 def size(n):
-    for unit in ('B', 'KB', 'MB'):
-        if n < 1024 or unit == 'MB':
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024 or unit == 'GB':
             return ('%d %s' if unit == 'B' else '%.1f %s') % (n, unit)
         n /= 1024
+
+
+def total(src):
+    """count() of src's files, with their total size if all of it is known."""
+    text = count(src.files)
+    if all(n in src.sizes for n, is_dir in src.files if not is_dir) and not any(d for _, d in src.files):
+        text += ', %s' % size(sum(src.sizes.values()))
+    return text
+
+
+def printable(line, width=100):
+    return ''.join(c if c.isprintable() else '?' for c in line.replace('\t', '    ')[:width])
 
 
 def destination(ep, names):
@@ -515,8 +596,8 @@ def destination(ep, names):
     if ep.host is None:
         return os.access(ep.dir, os.W_OK), {n for n in names if os.path.exists(os.path.join(ep.dir, n))}
     lines = remote(ep.host, REMOTE_DEST, ep.session, ep.dir if ep.plain else '', *names)
-    ep.dir = lines[0]
-    return lines[1] == 'w', set(lines[2:])
+    ep.dir, ep.home = lines[0], lines[1]
+    return lines[2] == 'w', set(lines[3:])
 
 
 def transfer(src, dst, client):
@@ -544,18 +625,29 @@ def copy_files(src, dst, client):
     if not writable:
         raise Error('destination is not writable: %s' % dst.label())
 
-    print('from  %s' % src.ep.label())
-    print('to    %s' % dst.label())
-    print()
+    # the route: source, the files flowing down, destination
+    width = max(len(src.ep.who()), len(dst.who()))
+    pipe = style('|', BLUE)
+    listed = len(files) if len(files) <= MAX_LISTED else MAX_LISTED - 1
     shown = [n + ('/' if d else '') + (' -> ' + dst.rename if dst.rename else '') for n, d in files]
-    width = max(len(s) for s in shown) + 1
-    for s, name in zip(shown, names):
-        note = '  <- exists, will be overwritten' if name in existing else ''
-        print('  %-*s%s' % (width, s, note))
+    name_width = max(len(t) for t in shown[:listed])
     print()
-    print('Copy %s? [y/N] ' % count(files), end='', flush=True)
+    print('  %s  %s' % (src.ep.styled_who(width), src.ep.tilde()))
+    for (n, is_dir), text, name in list(zip(files, shown, names))[:listed]:
+        note = style('  overwrites existing', YELLOW) if name in existing else ''
+        sz = size(src.sizes[n]) if n in src.sizes else ''
+        print('    %s  %s %s%s' % (pipe, style(text.ljust(name_width), BLUE if is_dir else ''),
+                                  style(sz.rjust(9), DIM), note))
+    if listed < len(files):
+        over = sum(1 for name in names[listed:] if name in existing)
+        rest = '... and %d more' % (len(files) - listed) + (', %d overwriting existing' % over if over else '')
+        print('    %s  %s' % (pipe, style(rest, YELLOW if over else DIM)))
+    print('    %s' % style('v', BLUE))
+    print('  %s  %s' % (dst.styled_who(width), dst.tilde()))
+    print()
+    print('  %s copy %s, any other key cancels ' % (style('y', BOLD, GREEN), total(src)), end='', flush=True)
     if getch() not in ('y', 'Y'):
-        print('cancelled')
+        print(style('cancelled', DIM))
         return
     print()
 
@@ -563,10 +655,15 @@ def copy_files(src, dst, client):
     if src.ep.host is not None and dst.host is not None:
         argv.append('-3')
     argv += [src.ep.spec(n) for n, _ in files] + [dst.spec(dst.rename or '')]
-    print('$ %s' % ' '.join(shlex.quote(a) for a in argv), flush=True)
+    print(style('\n  copying...', DIM), flush=True)
+    # scp's progress meter in dim too
+    sys.stdout.write('\033[2m' if COLOR else '')
+    sys.stdout.flush()
     rc = subprocess.run(argv).returncode
+    sys.stdout.write('\033[0m' if COLOR else '')
     if rc != 0:
         raise Error('scp failed with exit status %d' % rc)
+    done('copied %s to %s' % (count(files), dst.tilde(dst.rename or '')))
     message(client, 'tmux-scp: copied %s to %s' % (summary(files), dst.label()))
 
 
@@ -586,31 +683,41 @@ def to_clipboard(src, client):
     if b'\0' in data:
         raise Error('%s looks binary, not copying it to the clipboard' % name)
     run(['pbcopy', '-pboard', PASTEBOARD], input=data, env=UTF8_ENV)
+    done('copied %s (%s) to the clipboard' % (name, size(len(data))))
     message(client, 'tmux-scp: copied %s (%s) to the clipboard' % (src.ep.label(name), size(len(data))))
 
 
 def from_clipboard(data, dst, client):
+    if dst.dir is None:
+        # a remote tmux pane: ask it for the directory before showing the route
+        destination(dst, [])
     lines = data.decode(errors='replace').splitlines()
-    print('from  clipboard, %s, %d line%s' % (size(len(data)), len(lines), '' if len(lines) == 1 else 's'))
+    width = max(len('clipboard'), len(dst.who()))
+    pipe = style('|', BLUE)
+    print()
+    print('  %s  %s' % (style('clipboard'.ljust(width), BOLD, CYAN),
+                        style('%s, %d line%s' % (size(len(data)), len(lines), '' if len(lines) == 1 else 's'), DIM)))
     for line in lines[:5]:
-        print('  | ' + ''.join(c if c.isprintable() else '?' for c in line.replace('\t', '    ')[:100]))
+        print('    %s  %s' % (pipe, printable(line)))
     if len(lines) > 5:
-        print('  | ...')
+        print('    %s  %s' % (pipe, style('...', DIM)))
+    print('    %s' % style('v', BLUE))
+    print('  %s  %s' % (dst.styled_who(width), dst.tilde()))
     print()
     name = dst.rename
     if not name:
         default = time.strftime('clipboard-%Y%m%d-%H%M%S.txt')
-        name = input('Save as (Ctrl-C cancels) [%s]: ' % default).strip() or default
+        name = input('  %s as %s, Ctrl-C cancels: ' % (style('Save', BOLD, GREEN), style('[%s]' % default, DIM))).strip() or default
         if '/' in name:
             raise Error('the name must not contain /')
     writable, existing = destination(dst, [name])
     if not writable:
         raise Error('destination is not writable: %s' % dst.label())
-    print('to    %s' % dst.label(name))
     if name in existing:
-        print('%s exists, overwrite? [y/N] ' % name, end='', flush=True)
+        print('  %s exists, %s overwrites, any other key cancels ' % (style(name, YELLOW), style('y', BOLD, GREEN)),
+              end='', flush=True)
         if getch() not in ('y', 'Y'):
-            print('cancelled')
+            print(style('cancelled', DIM))
             return
         print()
     if dst.host is None:
@@ -618,6 +725,7 @@ def from_clipboard(data, dst, client):
             f.write(data)
     else:
         run(ssh_argv(dst.host, REMOTE_WRITE, dst.path(name)), input=data)
+    done('saved %s to %s' % (size(len(data)), dst.tilde(name)))
     message(client, 'tmux-scp: saved the clipboard (%s) to %s' % (size(len(data)), dst.label(name)))
 
 
@@ -631,14 +739,25 @@ def getch():
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-def in_popup(client, args):
-    """Re-run in a popup unless already on a terminal; run-shell has none."""
+def in_popup(client, args, title='tmux-scp', lines=None):
+    """Re-run in a popup unless already on a terminal; run-shell has none.
+
+    With lines, the popup is sized to fit that much output.
+    """
     if sys.stdin.isatty():
         return
-    argv = ['tmux', 'display-popup', '-E', '-w', '80%', '-h', '50%', '-T', ' tmux-scp ']
+    border = tmux('show-option', '-gqv', '@tmux-scp-border-style') or 'fg=blue'
+    height = '50%'
+    if lines:
+        client_height = int(tmux('display-message', '-p', *(['-c', client] if client else []), '#{client_height}'))
+        height = str(min(lines + 2, client_height * 9 // 10))
+    argv = ['tmux', 'display-popup', '-E', '-b', 'rounded', '-S', border, '-w', '80%', '-h', height,
+            '-T', '#[bold] %s ' % title]
     if client:
         argv += ['-c', client, '-e', 'TMUX_SCP_CLIENT=%s' % client]
-    os.execvp('tmux', argv + [SELF] + args)
+    subprocess.run(argv + [SELF] + args)
+    # errors were shown in the popup already, run-shell would report them again
+    sys.exit(0)
 
 
 def interactive(fn):
@@ -646,7 +765,8 @@ def interactive(fn):
     try:
         fn()
     except (Error, OSError) as e:
-        print('\ntmux-scp: %s\n\npress any key to close' % e, flush=True)
+        print('\n  %s %s\n\n  %s' % (style('tmux-scp:', BOLD, RED), e, style('press any key to close', DIM)),
+              flush=True)
         getch()
         sys.exit(1)
     except KeyboardInterrupt:
@@ -666,7 +786,8 @@ def cmd_yank(places, client):
             raise Error('the clipboard holds text, not paths of existing files; use :scp clip TO to save it as a file')
         os.makedirs(os.path.dirname(STATE), exist_ok=True)
         with open(STATE, 'w') as f:
-            json.dump({'src': src.ep.to_dict(), 'files': src.files}, f)
+            json.dump({'src': src.ep.to_dict(), 'files': src.files, 'sizes': src.sizes}, f)
+        done('yanked %s from %s' % (total(src), src.ep.tilde()))
         message(client, 'tmux-scp: yanked %s from %s' % (summary(src.files), src.ep.label()))
 
     if sys.stdin.isatty():
@@ -678,23 +799,32 @@ def cmd_yank(places, client):
         message(client, 'tmux-scp: %s' % e)
 
 
+def load_yank():
+    try:
+        with open(STATE) as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        raise Error('nothing yanked yet, yank some files first')
+    return Files(Endpoint(**state['src']), state['files'], state.get('sizes'))
+
+
 def cmd_put(places, client):
-    in_popup(client, ['put'] + places)
+    try:
+        n = len(load_yank().files)
+        # the route, the prompt and scp's progress, one line per file
+        listed = min(n, MAX_LISTED)
+        in_popup(client, ['put'] + places, 'tmux-scp: put %s' % count([None] * n), 2 * listed + 12)
+    except (Error, ValueError):
+        in_popup(client, ['put'] + places, 'tmux-scp: put')
 
     def put():
-        place = one_place(places)
-        try:
-            with open(STATE) as f:
-                state = json.load(f)
-        except FileNotFoundError:
-            raise Error('nothing yanked yet, yank some files first')
-        transfer(Files(Endpoint(**state['src']), state['files']), resolve_dest(place), client)
+        transfer(load_yank(), resolve_dest(one_place(places)), client)
 
     interactive(put)
 
 
 def cmd_scp(places, client):
-    in_popup(client, ['scp'] + places)
+    in_popup(client, ['scp'] + places, 'tmux-scp: scp')
 
     def scp():
         if len(places) not in (1, 2):
@@ -712,7 +842,7 @@ def cmd_show(places):
         print('session: %s' % ('(none, plain ssh)' if ep.plain else ep.session or '(default)'))
     lines = screen(ep, pane)
     try:
-        files = summary(existing_files(ep, command_words(lines)), 1000)
+        files = summary(existing_files(ep, command_words(lines)).files, 1000)
     except Error as e:
         files = str(e)
     print('dir:     %s' % ep.dir)
