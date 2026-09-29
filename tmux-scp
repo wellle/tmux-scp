@@ -4,7 +4,13 @@
     tmux-scp yank [FROM]    remember the files at FROM
     tmux-scp put [TO]       copy the yanked files to TO
     tmux-scp scp [FROM] TO  copy the files at FROM to TO
+    tmux-scp fetch [FROM]   copy the files at FROM, or else the yanked ones,
+                            into a local directory: the tmux option
+                            @tmux-scp-fetch-dir, default /tmp/tmux-scp
     tmux-scp show [PANE]    print what PANE resolves to, for debugging
+
+Copying asks for confirmation: y copies, c also puts the new paths on the
+clipboard, one per line, as user@host:path for remote ones.
 
 FROM and TO default to the current pane and are one of:
 
@@ -188,6 +194,13 @@ def run(argv, input=None, env=None):
 
 def tmux(*args):
     return run(['tmux'] + list(args)).decode(errors='replace').rstrip('\n')
+
+
+def tmux_option(name, default):
+    try:
+        return tmux('show-option', '-gqv', name) or default
+    except Error:
+        return default
 
 
 def ssh_argv(host, script, *args):
@@ -684,8 +697,10 @@ def copy_files(src, dst, client):
         print('    %s  %s' % (bang, style('... and %d more will be overwritten or merged into' % (len(replaced) - replaced_listed),
                                           YELLOW)))
     print()
-    print('  %s copy %s, any other key cancels ' % (style('y', BOLD, GREEN), total(src)), end='', flush=True)
-    if getch() not in ('y', 'Y'):
+    print('  %s copy %s, %s also copy their paths, any other key cancels '
+          % (style('y', BOLD, GREEN), total(src), style('c', BOLD, GREEN)), end='', flush=True)
+    key = getch().lower()
+    if key not in ('y', 'c'):
         print(style('cancelled', DIM))
         return
     print()
@@ -702,7 +717,12 @@ def copy_files(src, dst, client):
     sys.stdout.write('\033[0m' if COLOR else '')
     if rc != 0:
         raise Error('scp failed with exit status %d' % rc)
-    done('copied %s to %s' % (count(files), dst.tilde(dst.rename or '')))
+    copied = 'copied %s to %s' % (count(files), dst.tilde(dst.rename or ''))
+    if key == 'c':
+        paths = [dst.path(n) if dst.host is None else '%s:%s' % (dst.who(), dst.path(n)) for n in names]
+        run(['pbcopy', '-pboard', PASTEBOARD], input=''.join(p + '\n' for p in paths).encode(), env=UTF8_ENV)
+        copied += ', %s on the clipboard' % ('its path' if len(paths) == 1 else 'their paths')
+    done(copied)
     message(client, 'tmux-scp: copied %s to %s' % (summary(files), dst.label()))
 
 
@@ -786,7 +806,7 @@ def in_popup(client, args, title='tmux-scp', lines=None):
     """
     if sys.stdin.isatty():
         return
-    border = tmux('show-option', '-gqv', '@tmux-scp-border-style') or 'fg=blue'
+    border = tmux_option('@tmux-scp-border-style', 'fg=blue')
     height = '50%'
     if lines:
         client_height = int(tmux('display-message', '-p', *(['-c', client] if client else []), '#{client_height}'))
@@ -864,6 +884,27 @@ def cmd_put(places, client):
     interactive(put)
 
 
+def cmd_fetch(places, client):
+    fetch_dir = os.path.expanduser(tmux_option('@tmux-scp-fetch-dir', '/tmp/tmux-scp'))
+    if places:
+        in_popup(client, ['fetch'] + places, 'tmux-scp: fetch')
+    else:
+        try:
+            n = len(load_yank().files)
+            in_popup(client, ['fetch'], 'tmux-scp: fetch %s' % count([None] * n), 3 * min(n, MAX_LISTED) + 12)
+        except (Error, ValueError):
+            in_popup(client, ['fetch'], 'tmux-scp: fetch')
+
+    def fetch():
+        src = resolve_source(one_place(places)) if places else load_yank()
+        if isinstance(src, Text):
+            raise Error('the clipboard holds text, not paths of existing files; use :scp clip TO to save it as a file')
+        os.makedirs(fetch_dir, exist_ok=True)
+        transfer(src, Endpoint(dir=fetch_dir.rstrip('/') or '/'), client)
+
+    interactive(fetch)
+
+
 def cmd_scp(places, client):
     in_popup(client, ['scp'] + places, 'tmux-scp: scp')
 
@@ -907,6 +948,8 @@ def main():
         cmd_put(places, client)
     elif cmd == 'scp':
         cmd_scp(places, client)
+    elif cmd == 'fetch':
+        cmd_fetch(places, client)
     elif cmd == 'show':
         try:
             cmd_show(places)

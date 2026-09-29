@@ -19,7 +19,7 @@ tmux bind-key "$yank_key" run-shell -b "'$bin' --client '#{client_name}' yank '#
 tmux bind-key "$put_key" run-shell -b "'$bin' --client '#{client_name}' put '#{pane_id}'"
 
 i=$alias_index
-for cmd in scp yank put; do
+for cmd in scp yank put fetch; do
     popup="display-popup -E -b rounded -S '$border' -w 80% -h 50% -T '#[bold] tmux-scp: $cmd '"
     tmux set-option -s "command-alias[$i]" "$cmd=$popup '$bin' $cmd"
     i=$((i + 1))

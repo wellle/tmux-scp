@@ -77,6 +77,13 @@ The same thing works as tmux commands (`prefix :`), with places you name:
 | save the clipboard text as a file on a host | `:scp clip bottom` (asks for a name) |
 | yank files copied in Finder, or paths copied as text | `:yank clip`, then prefix C-p |
 | put the yank somewhere without going there | `:put ~/tmp`, `:put clip` |
+| download the yank to a local scratch directory | `:fetch` (into `/tmp/tmux-scp`) |
+| download from a pane without yanking first | `:fetch top` |
+
+In any copy's popup, `c` instead of `y` also puts the new paths on the
+clipboard, one per line, as `user@host:path` for remote ones. With `:fetch`,
+that is a quick way to get a file from a host into a Claude or other local
+session: yank it, `:fetch`, `c`, and paste the path.
 
 A place is one of:
 
@@ -119,8 +126,9 @@ Options, set them before the plugin loads:
 |--------|---------|-|
 | `@tmux-scp-yank-key` | `C-y` | prefix key to yank |
 | `@tmux-scp-put-key` | `C-p` | prefix key to put (many configs have `p` as `paste-buffer`) |
-| `@tmux-scp-alias-index` | `100` | first of the three `command-alias` slots used for `:scp`, `:yank` and `:put` |
+| `@tmux-scp-alias-index` | `100` | first of the four `command-alias` slots used for `:scp`, `:yank`, `:put` and `:fetch` |
 | `@tmux-scp-border-style` | `fg=blue` | style of the popup's border and title |
+| `@tmux-scp-fetch-dir` | `/tmp/tmux-scp` | where `:fetch` copies to |
 
 The popup uses colors unless `NO_COLOR` is set.
 
