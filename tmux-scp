@@ -146,7 +146,8 @@ exit 0
 
 # $1: session, $2: directory or empty for the session's, $3...: names.
 # Prints the absolute directory, $HOME, "w" or "r" for whether the directory
-# is writable, then each name that already exists there.
+# is writable, then "SIZE NAME" for each name that already exists there, with
+# "-" as the size of directories and "?" of anything but regular files.
 REMOTE_DEST = 't=$1' + REMOTE_TM + REMOTE_EXPAND + '''
 d=$2
 shift 2
@@ -155,7 +156,16 @@ cd "$d" || exit 1
 pwd
 printf '%s\\n' "$HOME"
 if [ -w . ]; then echo w; else echo r; fi
-for f; do [ -e "$f" ] && printf '%s\\n' "$f"; done
+for f; do
+    if [ -d "$f" ]; then
+        printf '%s %s\\n' - "$f"
+    elif [ -f "$f" ]; then
+        s=$(wc -c < "$f" | tr -d ' ')
+        printf '%s %s\\n' "${s:-?}" "$f"
+    elif [ -e "$f" ]; then
+        printf '%s %s\\n' '?' "$f"
+    fi
+done
 exit 0
 '''
 
@@ -591,13 +601,32 @@ def printable(line, width=100):
     return ''.join(c if c.isprintable() else '?' for c in line.replace('\t', '    ')[:width])
 
 
+# the size destination() gives for an existing directory
+DIR = 'dir'
+
+
 def destination(ep, names):
-    """Fill in ep.dir and return (writable, set of names that already exist)."""
+    """Fill in ep.dir and return whether it is writable, and a dict of the
+    names that already exist there to their size: bytes, DIR or None."""
     if ep.host is None:
-        return os.access(ep.dir, os.W_OK), {n for n in names if os.path.exists(os.path.join(ep.dir, n))}
+        existing = {}
+        for n in names:
+            p = os.path.join(ep.dir, n)
+            if os.path.exists(p):
+                existing[n] = DIR if os.path.isdir(p) else os.path.getsize(p) if os.path.isfile(p) else None
+        return os.access(ep.dir, os.W_OK), existing
     lines = remote(ep.host, REMOTE_DEST, ep.session, ep.dir if ep.plain else '', *names)
     ep.dir, ep.home = lines[0], lines[1]
-    return lines[2] == 'w', set(lines[3:])
+    existing = {}
+    for line in lines[3:]:
+        if line:
+            sz, name = line.split(' ', 1)
+            existing[name] = DIR if sz == '-' else int(sz) if sz.isdigit() else None
+    return lines[2] == 'w', existing
+
+
+def existing_size(sz):
+    return size(sz) if isinstance(sz, int) else ''
 
 
 def transfer(src, dst, client):
@@ -630,20 +659,30 @@ def copy_files(src, dst, client):
     pipe = style('|', BLUE)
     listed = len(files) if len(files) <= MAX_LISTED else MAX_LISTED - 1
     shown = [n + ('/' if d else '') + (' -> ' + dst.rename if dst.rename else '') for n, d in files]
-    name_width = max(len(t) for t in shown[:listed])
+    # the files the copy replaces, listed under the destination
+    replaced = [n for n in names if n in existing]
+    replaced_listed = len(replaced) if len(replaced) <= MAX_LISTED else MAX_LISTED - 1
+    replaced_shown = [n + ('/' if existing[n] == DIR else '') for n in replaced]
+    name_width = max(len(t) for t in shown[:listed] + replaced_shown[:replaced_listed])
     print()
     print('  %s  %s' % (src.ep.styled_who(width), src.ep.tilde()))
-    for (n, is_dir), text, name in list(zip(files, shown, names))[:listed]:
-        note = style('  overwrites existing', YELLOW) if name in existing else ''
+    for (n, is_dir), text in list(zip(files, shown))[:listed]:
         sz = size(src.sizes[n]) if n in src.sizes else ''
-        print('    %s  %s %s%s' % (pipe, style(text.ljust(name_width), BLUE if is_dir else ''),
-                                  style(sz.rjust(9), DIM), note))
+        print('    %s  %s %s' % (pipe, style(text.ljust(name_width), BLUE if is_dir else ''), style(sz.rjust(9), DIM)))
     if listed < len(files):
-        over = sum(1 for name in names[listed:] if name in existing)
-        rest = '... and %d more' % (len(files) - listed) + (', %d overwriting existing' % over if over else '')
-        print('    %s  %s' % (pipe, style(rest, YELLOW if over else DIM)))
+        print('    %s  %s' % (pipe, style('... and %d more' % (len(files) - listed), DIM)))
     print('    %s' % style('v', BLUE))
     print('  %s  %s' % (dst.styled_who(width), dst.tilde()))
+    bang = style('!', YELLOW)
+    for n, text in list(zip(replaced, replaced_shown))[:replaced_listed]:
+        print('    %s  %s %s  %s' % (bang, style(text.ljust(name_width), BLUE if existing[n] == DIR else ''),
+                                    style(existing_size(existing[n]).rjust(9), DIM),
+                                    # scp -r copies into an existing directory, keeping what else is there
+                                    style('will be merged into' if existing[n] == DIR else 'will be overwritten',
+                                          YELLOW)))
+    if replaced_listed < len(replaced):
+        print('    %s  %s' % (bang, style('... and %d more will be overwritten or merged into' % (len(replaced) - replaced_listed),
+                                          YELLOW)))
     print()
     print('  %s copy %s, any other key cancels ' % (style('y', BOLD, GREEN), total(src)), end='', flush=True)
     if getch() not in ('y', 'Y'):
@@ -714,8 +753,9 @@ def from_clipboard(data, dst, client):
     if not writable:
         raise Error('destination is not writable: %s' % dst.label())
     if name in existing:
-        print('  %s exists, %s overwrites, any other key cancels ' % (style(name, YELLOW), style('y', BOLD, GREEN)),
-              end='', flush=True)
+        sz = existing_size(existing[name])
+        print('  %s exists%s, %s overwrites, any other key cancels ' % (
+            style(name, YELLOW), style(' (%s)' % sz, DIM) if sz else '', style('y', BOLD, GREEN)), end='', flush=True)
         if getch() not in ('y', 'Y'):
             print(style('cancelled', DIM))
             return
@@ -811,9 +851,10 @@ def load_yank():
 def cmd_put(places, client):
     try:
         n = len(load_yank().files)
-        # the route, the prompt and scp's progress, one line per file
+        # the route, the prompt and scp's progress, one line per file, and
+        # room for as many files being overwritten
         listed = min(n, MAX_LISTED)
-        in_popup(client, ['put'] + places, 'tmux-scp: put %s' % count([None] * n), 2 * listed + 12)
+        in_popup(client, ['put'] + places, 'tmux-scp: put %s' % count([None] * n), 3 * listed + 12)
     except (Error, ValueError):
         in_popup(client, ['put'] + places, 'tmux-scp: put')
 

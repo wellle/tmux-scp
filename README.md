@@ -46,9 +46,10 @@ command line:
    |                                                            |
    |  me@app-1.example.com  ~/logs                              |
    |    |  report.csv    12.3 KB                                |
-   |    |  errors.log     4.1 MB  overwrites existing           |
+   |    |  errors.log     4.1 MB                                |
    |    v                                                       |
    |  me@db-2.example.com   ~/tmp                               |
+   |    !  errors.log        0 B  will be overwritten           |
    |                                                            |
    |  y copy 2 files, 4.1 MB, any other key cancels             |
    +------------------------------------------------------------+
