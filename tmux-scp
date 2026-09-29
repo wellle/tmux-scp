@@ -1,0 +1,749 @@
+#!/usr/bin/python3
+"""Copy files between tmux panes, local paths and the clipboard.
+
+    tmux-scp yank [FROM]    remember the files at FROM
+    tmux-scp put [TO]       copy the yanked files to TO
+    tmux-scp scp [FROM] TO  copy the files at FROM to TO
+    tmux-scp show [PANE]    print what PANE resolves to, for debugging
+
+FROM and TO default to the current pane and are one of:
+
+    a tmux pane   %24, :4.2, {marked}, ..., or the shorthands top, bottom,
+                  left, right, last and marked for {top}, {bottom}, ...
+    a local path  anything starting with / or ~. As FROM a file, directory
+                  or quoted glob; as TO a directory, or a new file name when
+                  copying a single file.
+    clip          the clipboard. As FROM the files copied in Finder, or the
+                  files it names if its text is nothing but existing local
+                  paths, one per line, or else its text, saved under a name
+                  you are asked for. As TO the contents of a single text file.
+
+For a pane, the files are the words on the prompt line the cursor is on, for
+example an unsent `ls tokens-1.txt triples.csv`. If that line has none, the
+last line above it with the same prompt is used, so an `ls` that already ran
+works too. Words that are not existing files (like the `ls`) are dropped and
+globs and ~ are expanded like the pane's shell would.
+
+A pane counts as remote when its foreground process is ssh, and the host
+comes from the ssh command line. If that command attaches a remote tmux
+(`ssh host -t tmux attach -t NAME`), the directory and screen come from that
+session. Otherwise the screen is the pane itself and the directory is the one
+in the prompt, which must show it in full (like bash's \\w). A user@host in
+that prompt must match the ssh destination, so a nested ssh or a sudo shell
+is refused rather than copying to the wrong place.
+
+Remote to remote copies use `scp -3`, which streams through this machine
+without writing to its disk.
+
+Options:
+    --client NAME  tmux client to show messages on (the key bindings pass it)
+
+Environment:
+    TMUX_SCP_PROMPT      regex ending the prompt, default '[$#%>:]( |$)'
+    TMUX_SCP_SESSION     remote tmux session when the ssh command names none,
+                         instead of reading the directory from the prompt
+    TMUX_SCP_PASTEBOARD  'general' (default) or 'find', which tests use to
+                         leave the real clipboard alone
+"""
+
+import glob
+import json
+import os
+import posixpath
+import re
+import shlex
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+SELF = os.path.abspath(__file__)
+STATE = os.path.expanduser('~/.cache/tmux-scp/yank.json')
+PROMPT_RE = re.compile(os.environ.get('TMUX_SCP_PROMPT', r'[$#%>:]( |$)'))
+# the directory and user@host in prompts like `user@host ~/dir $`,
+# `user@host:~/dir$` or `[user@host /tmp]$`
+PROMPT_DIR_RE = re.compile(r'(?:^|[\s:\[(])((?:~|/)[^\s\])]*)')
+PROMPT_WHO_RE = re.compile(r'([\w.-]+)@([\w.-]+)')
+SHORTHANDS = {k: '{%s}' % k for k in ('top', 'bottom', 'left', 'right', 'last', 'marked')}
+OPERATORS = {'|', '||', '&', '&&', ';', '>', '>>', '<', '2>', '2>&1'}
+
+CLIP_WORDS = ('clip', 'clipboard')
+CLIP_LIMIT = 10 << 20
+PASTEBOARD = os.environ.get('TMUX_SCP_PASTEBOARD', 'general')
+# pbcopy and pbpaste assume MacRoman unless told otherwise
+UTF8_ENV = dict(os.environ, LC_CTYPE='UTF-8')
+
+# JXA printing the paths of the files copied in Finder, one per line
+CLIP_FILES_JS = '''
+ObjC.import('AppKit');
+var pb = %s;
+var opts = $.NSDictionary.dictionaryWithObjectForKey($.NSNumber.numberWithBool(true), 'NSPasteboardURLReadingFileURLsOnlyKey');
+var urls = pb.readObjectsForClassesOptions($.NSArray.arrayWithObject($.NSURL), opts);
+var out = [];
+for (var i = 0; i < urls.count; i++) out.push(urls.objectAtIndex(i).path.js);
+out.join('\\n');
+''' % ("$.NSPasteboard.pasteboardWithName('Apple CFPasteboard find')" if PASTEBOARD == 'find'
+       else '$.NSPasteboard.generalPasteboard')
+
+# ssh options that take an argument, see ssh(1)
+SSH_ARG_OPTS = 'BbcDEeFIiJLlmOopQRSWw'
+# ssh options that change where or how to connect, which scp would not know
+# about; they belong in ~/.ssh/config
+SSH_UNSUPPORTED = 'FiJp'
+
+# Shell function running a tmux command against session $t, or tmux's
+# default session if $t is empty. The target goes first because tmux stops
+# parsing flags at the first positional argument.
+REMOTE_TM = '''
+tm() { c=$1; shift; if [ -n "$t" ]; then tmux "$c" -t "$t:" "$@"; else tmux "$c" "$@"; fi; }
+'''
+
+# Shell function expanding a leading ~ like the shell would have in a prompt.
+REMOTE_EXPAND = '''
+expand() { case $1 in "~") printf '%s\\n' "$HOME";; "~/"*) printf '%s/%s\\n' "$HOME" "${1#"~/"}";; *) printf '%s\\n' "$1";; esac; }
+'''
+
+# $1: session. Prints the active pane's directory, then its lines up to the cursor.
+REMOTE_SCREEN = 't=$1' + REMOTE_TM + '''
+tm display -p '#{pane_current_path}' || exit 1
+tm capture-pane -p -J -E "$(tm display -p '#{cursor_y}')"
+'''
+
+# $1: directory, $2...: words. Prints the absolute directory, then "d NAME"
+# or "f NAME" for each existing file, expanding globs (IFS= keeps words with
+# spaces in one piece).
+REMOTE_FILES = REMOTE_EXPAND + '''
+cd "$(expand "$1")" || exit 1
+pwd
+shift
+IFS=
+for p; do
+    p=$(expand "$p")
+    for f in $p; do
+        if [ -d "$f" ]; then printf 'd %s\\n' "$f"; elif [ -e "$f" ]; then printf 'f %s\\n' "$f"; fi
+    done
+done
+exit 0
+'''
+
+# $1: session, $2: directory or empty for the session's, $3...: names.
+# Prints the absolute directory, "w" or "r" for whether it is writable, then
+# each name that already exists there.
+REMOTE_DEST = 't=$1' + REMOTE_TM + REMOTE_EXPAND + '''
+d=$2
+shift 2
+if [ -n "$d" ]; then d=$(expand "$d"); else d=$(tm display -p '#{pane_current_path}') || exit 1; fi
+cd "$d" || exit 1
+pwd
+if [ -w . ]; then echo w; else echo r; fi
+for f; do [ -e "$f" ] && printf '%s\\n' "$f"; done
+exit 0
+'''
+
+REMOTE_READ = 'exec head -c "$1" "$2"'
+REMOTE_WRITE = 'exec cat > "$1"'
+
+
+class Error(Exception):
+    pass
+
+
+def run(argv, input=None, env=None):
+    """Run argv and return its stdout as bytes."""
+    p = subprocess.run(argv, input=input, capture_output=True, env=env)
+    if p.returncode != 0:
+        err = p.stderr.decode(errors='replace').strip()
+        raise Error('%s: %s' % (argv[0], err or 'exit status %d' % p.returncode))
+    return p.stdout
+
+
+def tmux(*args):
+    return run(['tmux'] + list(args)).decode(errors='replace').rstrip('\n')
+
+
+def ssh_argv(host, script, *args):
+    cmd = 'sh -c %s _ %s' % (shlex.quote(script), ' '.join(shlex.quote(a) for a in args))
+    return ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, cmd]
+
+
+def remote(host, script, *args):
+    out = run(ssh_argv(host, script, *args)).decode(errors='replace')
+    return out.rstrip('\n').split('\n')
+
+
+def message(client, text):
+    argv = ['tmux', 'display-message', '-d', '5000']
+    if client:
+        argv += ['-c', client]
+    subprocess.run(argv + [text.replace('#', '##')])
+
+
+def is_clip(place):
+    return place in CLIP_WORDS
+
+
+def is_path(place):
+    return place is not None and place.startswith(('/', '~'))
+
+
+class Endpoint:
+    """Where files live: a directory, local or on an ssh host.
+
+    For a plain ssh pane (no remote tmux), dir is the prompt's directory and
+    may start with ~ until a remote call resolves it.
+    """
+
+    def __init__(self, host=None, session='', dir=None, plain=False):
+        self.host = host
+        self.session = session
+        self.dir = dir
+        self.plain = plain
+        # the file name to copy to, when TO names a file rather than a directory
+        self.rename = None
+        self._ssh_config = None
+
+    def to_dict(self):
+        return {'host': self.host, 'session': self.session, 'dir': self.dir, 'plain': self.plain}
+
+    def path(self, name):
+        return posixpath.join(self.dir, name)
+
+    def spec(self, name):
+        """The scp argument for name, relative to this endpoint's directory."""
+        if self.host is None:
+            return self.path(name)
+        return '%s:%s' % (self.host, self.path(name))
+
+    def ssh_config(self, key):
+        if self._ssh_config is None:
+            self._ssh_config = dict(line.split(' ', 1) for line in
+                                    run(['ssh', '-G', self.host]).decode().splitlines() if ' ' in line)
+        return self._ssh_config.get(key, '')
+
+    def user(self):
+        return self.host.split('@')[0] if '@' in self.host else self.ssh_config('user')
+
+    def label(self, name=''):
+        where = self.path(name) if name else self.dir
+        if self.host is None:
+            return 'local:%s' % where
+        return '%s@%s:%s' % (self.user(), self.host.split('@')[-1], where)
+
+    def same_place(self, other):
+        return (self.host, self.dir) == (other.host, other.dir)
+
+
+class Files:
+    """Files to copy: [name, is_dir] pairs, relative to an endpoint's directory."""
+
+    def __init__(self, ep, files):
+        self.ep = ep
+        self.files = files
+
+
+class Text:
+    """Text from the clipboard, to be saved as a file."""
+
+    def __init__(self, data):
+        self.data = data
+
+
+CLIPBOARD = object()
+
+
+def resolve_pane(target):
+    """Return the pane id and endpoint for a tmux pane target, or the current pane."""
+    argv = ['display', '-p']
+    if target:
+        argv += ['-t', SHORTHANDS.get(target, target)]
+    pane, tty_name, path = tmux(*argv, '#{pane_id}\t#{pane_tty}\t#{pane_current_path}').split('\t')
+    # display does not fail for a missing pane, it prints empty or garbage values
+    if not pane.startswith('%'):
+        raise Error("can't find pane: %s" % target)
+    ssh = foreground_ssh(tty_name)
+    return pane, (Endpoint(dir=path) if ssh is None else parse_ssh(ssh))
+
+
+def foreground_ssh(tty_name):
+    """Return the argv of the ssh in the foreground of a tty, if any."""
+    found = None
+    out = run(['ps', '-t', tty_name.replace('/dev/', ''), '-o', 'stat=,args=']).decode(errors='replace')
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        argv = parts[1].split()
+        if '+' in parts[0] and os.path.basename(argv[0]) == 'ssh':
+            found = argv
+    return found
+
+
+def parse_ssh(argv):
+    user = None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == '--':
+            i += 1
+            break
+        if not a.startswith('-') or a == '-':
+            break
+        for j, ch in enumerate(a[1:]):
+            if ch not in SSH_ARG_OPTS:
+                continue
+            val = a[j + 2:]
+            if not val:
+                i += 1
+                val = argv[i] if i < len(argv) else ''
+            if ch in SSH_UNSUPPORTED:
+                raise Error('ssh -%s is not supported, put it in ~/.ssh/config' % ch)
+            if ch == 'l':
+                user = val
+            break
+        i += 1
+    if i >= len(argv):
+        raise Error('no host in ssh command: %s' % ' '.join(argv))
+    host = argv[i]
+    if user and '@' not in host:
+        host = '%s@%s' % (user, host)
+    session = remote_session(argv[i + 1:])
+    if session is None:
+        return Endpoint(host=host, plain=True)
+    return Endpoint(host=host, session=session)
+
+
+def remote_session(words):
+    """Find NAME in a remote command like `tmux attach -t NAME || tmux new -s NAME`."""
+    for k, w in enumerate(words):
+        if os.path.basename(w) != 'tmux':
+            continue
+        for m in range(k + 1, len(words)):
+            if words[m] in ('-t', '-s') and m + 1 < len(words):
+                return words[m + 1]
+            if re.fullmatch(r'-[ts]\S+', words[m]):
+                return words[m][2:]
+        return ''
+    return os.environ.get('TMUX_SCP_SESSION')
+
+
+def screen(ep, pane):
+    """Fill in ep.dir and return the pane's lines up to its cursor."""
+    if ep.host is None or ep.plain:
+        y = tmux('display', '-p', '-t', pane, '#{cursor_y}')
+        lines = tmux('capture-pane', '-p', '-J', '-t', pane, '-E', y).split('\n')
+        if ep.plain:
+            prompt_dir(ep, lines)
+        return lines
+    lines = remote(ep.host, REMOTE_SCREEN, ep.session)
+    ep.dir = lines[0]
+    return lines[1:]
+
+
+def prompt_dir(ep, lines):
+    """Set a plain ssh endpoint's directory from the prompt at the cursor."""
+    m = PROMPT_RE.search(lines[-1]) if lines else None
+    if not m:
+        raise Error('no remote tmux, and the cursor is not on a prompt to read the directory from')
+    prompt = lines[-1][:m.start()]
+    dirs = PROMPT_DIR_RE.findall(prompt)
+    if not dirs:
+        raise Error('no remote tmux, and the prompt %r shows no full directory' % prompt.strip())
+    who = PROMPT_WHO_RE.search(prompt)
+    if who:
+        user, host = who.groups()
+        short = host.split('.')[0]
+        hosts = {ep.host.split('@')[-1].split('.')[0], ep.ssh_config('hostname').split('.')[0]}
+        if user != ep.user() or short not in hosts:
+            raise Error('the prompt says %s@%s, but the pane\'s ssh goes to %s@%s (nested ssh or sudo?)'
+                        % (user, host, ep.user(), ep.host.split('@')[-1]))
+    ep.dir = dirs[-1]
+
+
+def split_words(s):
+    # tolerate an unclosed quote on a half-typed command line
+    for suffix in ('', '"', "'"):
+        try:
+            return shlex.split(s + suffix)
+        except ValueError:
+            pass
+    return s.split()
+
+
+def command_words(lines):
+    """Return the candidate file words from the prompt line at the cursor."""
+    m = PROMPT_RE.search(lines[-1]) if lines else None
+    if not m:
+        raise Error('the cursor is not on a prompt line')
+    prompt = lines[-1][:m.start() + 1]
+    for line in reversed(lines):
+        if not line.startswith(prompt):
+            continue
+        words = []
+        for w in split_words(line[len(prompt):]):
+            if w in OPERATORS:
+                break
+            if not w.startswith('-'):
+                words.append(w)
+        if words:
+            return words
+    raise Error('no file names on the command line')
+
+
+def dedupe(files):
+    seen = set()
+    unique = []
+    for name, is_dir in files:
+        if name not in seen:
+            seen.add(name)
+            unique.append([name, is_dir])
+    return unique
+
+
+def existing_files(ep, words):
+    """Return [name, is_dir] for each word that names files in ep.dir."""
+    if ep.host is not None:
+        lines = remote(ep.host, REMOTE_FILES, ep.dir, *words)
+        ep.dir = lines[0]
+        files = [[line[2:], line[0] == 'd'] for line in lines[1:] if line]
+    else:
+        files = []
+        for w in map(os.path.expanduser, words):
+            full = os.path.join(ep.dir, w)
+            matches = sorted(glob.glob(full)) if glob.has_magic(w) else [full]
+            for f in matches:
+                if os.path.exists(f):
+                    name = f if os.path.isabs(w) else os.path.relpath(f, ep.dir)
+                    files.append([name, os.path.isdir(f)])
+    files = dedupe(files)
+    if not files:
+        raise Error('none of these exist in %s: %s' % (ep.dir, ' '.join(words)))
+    return files
+
+
+def local_files(paths):
+    """Return Files for absolute local paths, relative to their directory if they share one."""
+    parents = {os.path.dirname(p) for p in paths}
+    if len(parents) == 1:
+        return Files(Endpoint(dir=parents.pop()), dedupe([[os.path.basename(p), os.path.isdir(p)] for p in paths]))
+    return Files(Endpoint(dir='/'), dedupe([[p, os.path.isdir(p)] for p in paths]))
+
+
+def clip_paths(data):
+    """Return the local paths the clipboard text names, if it is nothing but existing ones."""
+    lines = [line.strip() for line in data.decode(errors='replace').splitlines() if line.strip()]
+    if not lines or len(lines) > 1000:
+        return []
+    paths = []
+    for line in lines:
+        # a path copied with quotes or escaped spaces
+        words = split_words(line)
+        word = words[0] if len(words) == 1 else line
+        p = os.path.expanduser(word)
+        if not is_path(word) or not os.path.exists(p):
+            return []
+        paths.append(p.rstrip('/') or '/')
+    return paths
+
+
+def resolve_source(place):
+    """Return Files or Text for a FROM place."""
+    if is_clip(place):
+        js = run(['osascript', '-l', 'JavaScript', '-e', CLIP_FILES_JS]).decode()
+        paths = [p for p in js.split('\n') if p]
+        if paths:
+            return local_files(paths)
+        data = run(['pbpaste', '-pboard', PASTEBOARD], env=UTF8_ENV)
+        if not data:
+            raise Error('the clipboard is empty')
+        paths = clip_paths(data)
+        return local_files(paths) if paths else Text(data)
+    if is_path(place):
+        p = os.path.expanduser(place)
+        p = p.rstrip('/') or '/'
+        if p == '/':
+            raise Error('refusing to copy /')
+        matches = sorted(glob.glob(p)) if glob.has_magic(p) else [p]
+        matches = [m for m in matches if os.path.exists(m)]
+        if not matches:
+            raise Error('no such file: %s' % place)
+        return local_files(matches)
+    pane, ep = resolve_pane(place)
+    return Files(ep, existing_files(ep, command_words(screen(ep, pane))))
+
+
+def resolve_dest(place):
+    """Return an Endpoint or CLIPBOARD for a TO place."""
+    if is_clip(place):
+        return CLIPBOARD
+    if is_path(place):
+        p = os.path.expanduser(place)
+        if os.path.isdir(p):
+            return Endpoint(dir=p.rstrip('/') or '/')
+        parent, name = os.path.split(p)
+        if not name or not os.path.isdir(parent or '/'):
+            raise Error('no such directory: %s' % place)
+        ep = Endpoint(dir=parent or '/')
+        ep.rename = name
+        return ep
+    pane, ep = resolve_pane(place)
+    if ep.plain:
+        screen(ep, pane)
+    return ep
+
+
+def count(files):
+    return '%d file%s' % (len(files), '' if len(files) == 1 else 's')
+
+
+def summary(files, limit=120):
+    names = ', '.join(n + ('/' if d else '') for n, d in files)
+    if len(names) > limit:
+        names = names[:limit - 3] + '...'
+    return '%s (%s)' % (count(files), names)
+
+
+def size(n):
+    for unit in ('B', 'KB', 'MB'):
+        if n < 1024 or unit == 'MB':
+            return ('%d %s' if unit == 'B' else '%.1f %s') % (n, unit)
+        n /= 1024
+
+
+def destination(ep, names):
+    """Fill in ep.dir and return (writable, set of names that already exist)."""
+    if ep.host is None:
+        return os.access(ep.dir, os.W_OK), {n for n in names if os.path.exists(os.path.join(ep.dir, n))}
+    lines = remote(ep.host, REMOTE_DEST, ep.session, ep.dir if ep.plain else '', *names)
+    ep.dir = lines[0]
+    return lines[1] == 'w', set(lines[2:])
+
+
+def transfer(src, dst, client):
+    if dst is CLIPBOARD:
+        if isinstance(src, Text):
+            raise Error('the clipboard is already the clipboard')
+        to_clipboard(src, client)
+    elif isinstance(src, Text):
+        from_clipboard(src.data, dst, client)
+    else:
+        copy_files(src, dst, client)
+
+
+def copy_files(src, dst, client):
+    files = src.files
+    if dst.rename and len(files) != 1:
+        raise Error('there are %s, but %s is not a directory' % (count(files), dst.label(dst.rename)))
+    names = [dst.rename] if dst.rename else [posixpath.basename(n.rstrip('/')) for n, _ in files]
+    clashes = sorted({n for n in names if names.count(n) > 1})
+    if clashes:
+        raise Error('several files are named %s, they would overwrite each other' % ', '.join(clashes))
+    writable, existing = destination(dst, names)
+    if not dst.rename and src.ep.same_place(dst):
+        raise Error('source and destination are the same directory: %s' % dst.label())
+    if not writable:
+        raise Error('destination is not writable: %s' % dst.label())
+
+    print('from  %s' % src.ep.label())
+    print('to    %s' % dst.label())
+    print()
+    shown = [n + ('/' if d else '') + (' -> ' + dst.rename if dst.rename else '') for n, d in files]
+    width = max(len(s) for s in shown) + 1
+    for s, name in zip(shown, names):
+        note = '  <- exists, will be overwritten' if name in existing else ''
+        print('  %-*s%s' % (width, s, note))
+    print()
+    print('Copy %s? [y/N] ' % count(files), end='', flush=True)
+    if getch() not in ('y', 'Y'):
+        print('cancelled')
+        return
+    print()
+
+    argv = ['scp', '-r']
+    if src.ep.host is not None and dst.host is not None:
+        argv.append('-3')
+    argv += [src.ep.spec(n) for n, _ in files] + [dst.spec(dst.rename or '')]
+    print('$ %s' % ' '.join(shlex.quote(a) for a in argv), flush=True)
+    rc = subprocess.run(argv).returncode
+    if rc != 0:
+        raise Error('scp failed with exit status %d' % rc)
+    message(client, 'tmux-scp: copied %s to %s' % (summary(files), dst.label()))
+
+
+def to_clipboard(src, client):
+    if len(src.files) != 1:
+        raise Error('the clipboard takes the contents of a single file, not %s' % summary(src.files))
+    if src.files[0][1]:
+        raise Error('%s/ is a directory, the clipboard takes the contents of a single file' % src.files[0][0])
+    name = src.files[0][0]
+    if src.ep.host is None:
+        with open(src.ep.path(name), 'rb') as f:
+            data = f.read(CLIP_LIMIT + 1)
+    else:
+        data = run(ssh_argv(src.ep.host, REMOTE_READ, str(CLIP_LIMIT + 1), src.ep.path(name)))
+    if len(data) > CLIP_LIMIT:
+        raise Error('%s is over %s, too large for the clipboard' % (name, size(CLIP_LIMIT)))
+    if b'\0' in data:
+        raise Error('%s looks binary, not copying it to the clipboard' % name)
+    run(['pbcopy', '-pboard', PASTEBOARD], input=data, env=UTF8_ENV)
+    message(client, 'tmux-scp: copied %s (%s) to the clipboard' % (src.ep.label(name), size(len(data))))
+
+
+def from_clipboard(data, dst, client):
+    lines = data.decode(errors='replace').splitlines()
+    print('from  clipboard, %s, %d line%s' % (size(len(data)), len(lines), '' if len(lines) == 1 else 's'))
+    for line in lines[:5]:
+        print('  | ' + ''.join(c if c.isprintable() else '?' for c in line.replace('\t', '    ')[:100]))
+    if len(lines) > 5:
+        print('  | ...')
+    print()
+    name = dst.rename
+    if not name:
+        default = time.strftime('clipboard-%Y%m%d-%H%M%S.txt')
+        name = input('Save as (Ctrl-C cancels) [%s]: ' % default).strip() or default
+        if '/' in name:
+            raise Error('the name must not contain /')
+    writable, existing = destination(dst, [name])
+    if not writable:
+        raise Error('destination is not writable: %s' % dst.label())
+    print('to    %s' % dst.label(name))
+    if name in existing:
+        print('%s exists, overwrite? [y/N] ' % name, end='', flush=True)
+        if getch() not in ('y', 'Y'):
+            print('cancelled')
+            return
+        print()
+    if dst.host is None:
+        with open(dst.path(name), 'wb') as f:
+            f.write(data)
+    else:
+        run(ssh_argv(dst.host, REMOTE_WRITE, dst.path(name)), input=data)
+    message(client, 'tmux-scp: saved the clipboard (%s) to %s' % (size(len(data)), dst.label(name)))
+
+
+def getch():
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        return os.read(fd, 1).decode(errors='replace')
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def in_popup(client, args):
+    """Re-run in a popup unless already on a terminal; run-shell has none."""
+    if sys.stdin.isatty():
+        return
+    argv = ['tmux', 'display-popup', '-E', '-w', '80%', '-h', '50%', '-T', ' tmux-scp ']
+    if client:
+        argv += ['-c', client, '-e', 'TMUX_SCP_CLIENT=%s' % client]
+    os.execvp('tmux', argv + [SELF] + args)
+
+
+def interactive(fn):
+    """Run fn, and on error keep the popup open until a key is pressed."""
+    try:
+        fn()
+    except (Error, OSError) as e:
+        print('\ntmux-scp: %s\n\npress any key to close' % e, flush=True)
+        getch()
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+def one_place(places):
+    if len(places) > 1:
+        raise Error('expected one place, got %d: %s (quote paths with spaces)' % (len(places), ' '.join(places)))
+    return places[0] if places else None
+
+
+def cmd_yank(places, client):
+    def yank():
+        src = resolve_source(one_place(places))
+        if isinstance(src, Text):
+            raise Error('the clipboard holds text, not paths of existing files; use :scp clip TO to save it as a file')
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        with open(STATE, 'w') as f:
+            json.dump({'src': src.ep.to_dict(), 'files': src.files}, f)
+        message(client, 'tmux-scp: yanked %s from %s' % (summary(src.files), src.ep.label()))
+
+    if sys.stdin.isatty():
+        interactive(yank)
+        return
+    try:
+        yank()
+    except (Error, OSError) as e:
+        message(client, 'tmux-scp: %s' % e)
+
+
+def cmd_put(places, client):
+    in_popup(client, ['put'] + places)
+
+    def put():
+        place = one_place(places)
+        try:
+            with open(STATE) as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            raise Error('nothing yanked yet, yank some files first')
+        transfer(Files(Endpoint(**state['src']), state['files']), resolve_dest(place), client)
+
+    interactive(put)
+
+
+def cmd_scp(places, client):
+    in_popup(client, ['scp'] + places)
+
+    def scp():
+        if len(places) not in (1, 2):
+            raise Error('usage: scp [FROM] TO')
+        src_place, dst_place = ([None] + places)[-2:]
+        transfer(resolve_source(src_place), resolve_dest(dst_place), client)
+
+    interactive(scp)
+
+
+def cmd_show(places):
+    pane, ep = resolve_pane(one_place(places))
+    print('host:    %s' % (ep.host or '(local)'))
+    if ep.host:
+        print('session: %s' % ('(none, plain ssh)' if ep.plain else ep.session or '(default)'))
+    lines = screen(ep, pane)
+    try:
+        files = summary(existing_files(ep, command_words(lines)), 1000)
+    except Error as e:
+        files = str(e)
+    print('dir:     %s' % ep.dir)
+    print('label:   %s' % ep.label())
+    print('line:    %s' % (lines[-1] if lines else ''))
+    print('files:   %s' % files)
+
+
+def main():
+    args = sys.argv[1:]
+    client = os.environ.get('TMUX_SCP_CLIENT')
+    if len(args) >= 2 and args[0] == '--client':
+        client, args = args[1], args[2:]
+    if not args or args[0] in ('-h', '--help', 'help'):
+        print(__doc__.strip())
+        return
+    cmd, places = args[0], args[1:]
+    if cmd == 'yank':
+        cmd_yank(places, client)
+    elif cmd == 'put':
+        cmd_put(places, client)
+    elif cmd == 'scp':
+        cmd_scp(places, client)
+    elif cmd == 'show':
+        try:
+            cmd_show(places)
+        except Error as e:
+            sys.exit('tmux-scp: %s' % e)
+    else:
+        sys.exit('tmux-scp: unknown command %r, see tmux-scp --help' % cmd)
+
+
+if __name__ == '__main__':
+    main()
