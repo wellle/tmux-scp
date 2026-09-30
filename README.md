@@ -206,3 +206,7 @@ through your machine without writing anything to its disk.
 `tmux-scp show [PANE]` prints what a pane resolves to: host, remote session,
 directory, the command line it read and the files it found. `tmux-scp --help`
 has the full reference.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
