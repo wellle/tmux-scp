@@ -103,8 +103,8 @@ out.join('\\n');
 # ssh options that take an argument, see ssh(1)
 SSH_ARG_OPTS = 'BbcDEeFIiJLlmOopQRSWw'
 # ssh options that change where or how to connect, which scp would not know
-# about; they belong in ~/.ssh/config
-SSH_UNSUPPORTED = 'FiJp'
+# about; they belong in ~/.ssh/config. An -F config file is carried over.
+SSH_UNSUPPORTED = 'iJp'
 
 # Shell function running a tmux command against session $t, or tmux's
 # default session if $t is empty. The target goes first because tmux stops
@@ -203,13 +203,13 @@ def tmux_option(name, default):
         return default
 
 
-def ssh_argv(host, script, *args):
+def ssh_argv(ep, script, *args):
     cmd = 'sh -c %s _ %s' % (shlex.quote(script), ' '.join(shlex.quote(a) for a in args))
-    return ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', host, cmd]
+    return ['ssh'] + ep.ssh_opts() + ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', ep.host, cmd]
 
 
-def remote(host, script, *args):
-    out = run(ssh_argv(host, script, *args)).decode(errors='replace')
+def remote(ep, script, *args):
+    out = run(ssh_argv(ep, script, *args)).decode(errors='replace')
     return out.rstrip('\n').split('\n')
 
 
@@ -253,8 +253,10 @@ class Endpoint:
     may start with ~ until a remote call resolves it.
     """
 
-    def __init__(self, host=None, session='', dir=None, plain=False, home=None):
+    def __init__(self, host=None, session='', dir=None, plain=False, home=None, config=None):
         self.host = host
+        # the ssh config file the pane's ssh was given with -F, if any
+        self.config = config
         self.session = session
         self.dir = dir
         self.plain = plain
@@ -266,7 +268,10 @@ class Endpoint:
 
     def to_dict(self):
         return {'host': self.host, 'session': self.session, 'dir': self.dir, 'plain': self.plain,
-                'home': self.home}
+                'home': self.home, 'config': self.config}
+
+    def ssh_opts(self):
+        return ['-F', self.config] if self.config else []
 
     def path(self, name):
         return posixpath.join(self.dir, name)
@@ -280,7 +285,7 @@ class Endpoint:
     def ssh_config(self, key):
         if self._ssh_config is None:
             self._ssh_config = dict(line.split(' ', 1) for line in
-                                    run(['ssh', '-G', self.host]).decode().splitlines() if ' ' in line)
+                                    run(['ssh'] + self.ssh_opts() + ['-G', self.host]).decode().splitlines() if ' ' in line)
         return self._ssh_config.get(key, '')
 
     def user(self):
@@ -363,7 +368,7 @@ def foreground_ssh(tty_name):
 
 
 def parse_ssh(argv):
-    user = None
+    user = config = None
     i = 1
     while i < len(argv):
         a = argv[i]
@@ -383,6 +388,10 @@ def parse_ssh(argv):
                 raise Error('ssh -%s is not supported, put it in ~/.ssh/config' % ch)
             if ch == 'l':
                 user = val
+            if ch == 'F':
+                config = os.path.expanduser(val)
+                if not os.path.isabs(config):
+                    raise Error('ssh -F needs an absolute path, not %s' % val)
             break
         i += 1
     if i >= len(argv):
@@ -392,8 +401,8 @@ def parse_ssh(argv):
         host = '%s@%s' % (user, host)
     session = remote_session(argv[i + 1:])
     if session is None:
-        return Endpoint(host=host, plain=True)
-    return Endpoint(host=host, session=session)
+        return Endpoint(host=host, plain=True, config=config)
+    return Endpoint(host=host, session=session, config=config)
 
 
 def remote_session(words):
@@ -418,7 +427,7 @@ def screen(ep, pane):
         if ep.plain:
             prompt_dir(ep, lines)
         return lines
-    lines = remote(ep.host, REMOTE_SCREEN, ep.session)
+    lines = remote(ep, REMOTE_SCREEN, ep.session)
     ep.dir = lines[0]
     return lines[1:]
 
@@ -487,7 +496,7 @@ def existing_files(ep, words):
     """Return Files for the words that name files in ep.dir."""
     files, sizes = [], {}
     if ep.host is not None:
-        lines = remote(ep.host, REMOTE_FILES, ep.dir, *words)
+        lines = remote(ep, REMOTE_FILES, ep.dir, *words)
         ep.dir, ep.home = lines[0], lines[1]
         for line in lines[2:]:
             if line:
@@ -628,7 +637,7 @@ def destination(ep, names):
             if os.path.exists(p):
                 existing[n] = DIR if os.path.isdir(p) else os.path.getsize(p) if os.path.isfile(p) else None
         return os.access(ep.dir, os.W_OK), existing
-    lines = remote(ep.host, REMOTE_DEST, ep.session, ep.dir if ep.plain else '', *names)
+    lines = remote(ep, REMOTE_DEST, ep.session, ep.dir if ep.plain else '', *names)
     ep.dir, ep.home = lines[0], lines[1]
     existing = {}
     for line in lines[3:]:
@@ -706,7 +715,12 @@ def copy_files(src, dst, client):
         return
     print()
 
-    argv = ['scp', '-r']
+    # scp takes one config file for both hosts
+    configs = {ep.config for ep in (src.ep, dst) if ep.host is not None}
+    if len(configs) > 1:
+        raise Error('the two hosts use different ssh config files (ssh -F), scp can only take one')
+    config = configs.pop() if configs else None
+    argv = ['scp'] + (['-F', config] if config else []) + ['-r']
     if src.ep.host is not None and dst.host is not None:
         argv.append('-3')
     argv += [src.ep.spec(n) for n, _ in files] + [dst.spec(dst.rename or '')]
@@ -737,7 +751,7 @@ def to_clipboard(src, client):
         with open(src.ep.path(name), 'rb') as f:
             data = f.read(CLIP_LIMIT + 1)
     else:
-        data = run(ssh_argv(src.ep.host, REMOTE_READ, str(CLIP_LIMIT + 1), src.ep.path(name)))
+        data = run(ssh_argv(src.ep, REMOTE_READ, str(CLIP_LIMIT + 1), src.ep.path(name)))
     if len(data) > CLIP_LIMIT:
         raise Error('%s is over %s, too large for the clipboard' % (name, size(CLIP_LIMIT)))
     if b'\0' in data:
@@ -785,7 +799,7 @@ def from_clipboard(data, dst, client):
         with open(dst.path(name), 'wb') as f:
             f.write(data)
     else:
-        run(ssh_argv(dst.host, REMOTE_WRITE, dst.path(name)), input=data)
+        run(ssh_argv(dst, REMOTE_WRITE, dst.path(name)), input=data)
     done('saved %s to %s' % (size(len(data)), dst.tilde(name)))
     message(client, 'tmux-scp: saved the clipboard (%s) to %s' % (size(len(data)), dst.label(name)))
 
