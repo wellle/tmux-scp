@@ -109,7 +109,7 @@ On the hosts: a POSIX `sh`, and tmux if you use it there.
 Clone the repo and load the plugin in `~/.tmux.conf`:
 
 ```
-git clone <repo-url> ~/.tmux/plugins/tmux-scp
+git clone https://github.com/wellle/tmux-scp ~/.tmux/plugins/tmux-scp
 ```
 
 ```
@@ -117,7 +117,7 @@ run-shell ~/.tmux/plugins/tmux-scp/tmux-scp.tmux
 ```
 
 With [TPM](https://github.com/tmux-plugins/tpm), add
-`set -g @plugin '<owner>/tmux-scp'` instead. Then reload the config
+`set -g @plugin 'wellle/tmux-scp'` instead. Then reload the config
 (`tmux source-file ~/.tmux.conf`).
 
 Options, set them before the plugin loads:
