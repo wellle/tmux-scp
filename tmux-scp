@@ -697,8 +697,9 @@ def copy_files(src, dst, client):
         print('    %s  %s' % (bang, style('... and %d more will be overwritten or merged into' % (len(replaced) - replaced_listed),
                                           YELLOW)))
     print()
-    print('  %s copy %s, %s also copy their paths, any other key cancels '
-          % (style('y', BOLD, GREEN), total(src), style('c', BOLD, GREEN)), end='', flush=True)
+    print('  %s copy %s, %s also copy %s, any other key cancels '
+          % (style('y', BOLD, GREEN), total(src), style('c', BOLD, GREEN),
+             'its path' if len(files) == 1 else 'their paths'), end='', flush=True)
     key = getch().lower()
     if key not in ('y', 'c'):
         print(style('cancelled', DIM))
