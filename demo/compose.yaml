@@ -1,0 +1,25 @@
+# Two demo hosts on localhost, see README.md. setup.sh passes AUTHORIZED_KEY.
+name: tmux-scp-demo
+
+services:
+  web:
+    build: .
+    hostname: web-01
+    environment:
+      DEMO_USER: deploy
+      DEMO_DIR: exports
+      DEMO_FILES: web
+      AUTHORIZED_KEY: ${AUTHORIZED_KEY:?run setup.sh}
+    ports:
+      - "127.0.0.1:2221:22"
+
+  warehouse:
+    build: .
+    hostname: analytics-warehouse
+    environment:
+      DEMO_USER: data_pipeline
+      DEMO_DIR: imports
+      DEMO_FILES: warehouse
+      AUTHORIZED_KEY: ${AUTHORIZED_KEY:?run setup.sh}
+    ports:
+      - "127.0.0.1:2222:22"

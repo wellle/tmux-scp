@@ -1,0 +1,5 @@
+#!/bin/sh
+# ssh with the demo's config file, so the demo hosts need nothing in
+# ~/.ssh/config. tmux-scp sees the -F and uses it for its own calls too.
+demo=$(cd "$(dirname "$0")/.." && pwd)
+exec /usr/bin/ssh -F "$demo/.state/ssh_config" "$@"

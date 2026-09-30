@@ -149,6 +149,11 @@ Host *.example.com
     ServerAliveInterval 30
 ```
 
+### Trying it without servers
+
+[demo/](demo/README.md) has two throwaway hosts in Docker and a separate tmux
+setup for them, so you can try the whole flow on your machine.
+
 ## How it finds things
 
 **The host** comes from the `ssh` running in the pane, and scp connects with
@@ -189,8 +194,8 @@ through your machine without writing anything to its disk.
 - **macOS**: the clipboard uses `pbcopy`, `pbpaste` and `osascript` (for files
   copied in Finder). Everything else would also work on Linux.
 - **ssh flags**: of the flags on the pane's ssh command, only the user (`-l`)
-  is carried over; `-p`, `-J`, `-i` and `-F` are refused. Put them in
-  `~/.ssh/config`.
+  and a config file (`-F`, with an absolute path) are carried over; `-p`,
+  `-J` and `-i` are refused. Put them in `~/.ssh/config`, or in the `-F` file.
 - **Remote tmux**: the session has to be named in the ssh command, or set
   `TMUX_SCP_SESSION`. tmux-scp uses that session's active pane.
 - **Prompts** are recognised by ending in `$ `, `# `, `% `, `> ` or `: `.
