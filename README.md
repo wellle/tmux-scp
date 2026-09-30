@@ -3,6 +3,8 @@
 Copy files between tmux panes, even when they are logged in to different hosts.
 Point at the files, yank, switch to the other pane, put.
 
+![Yanking a file on web-01 with prefix C-y and putting it on analytics-warehouse with prefix C-p](docs/demo.gif)
+
 ## Why
 
 You are looking at a file on `app-1` in one pane, and it needs to go to `db-2`,
